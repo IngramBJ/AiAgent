@@ -1,11 +1,20 @@
-fastapi
-uvicorn[standard]
-pydantic
-requests
-python-dotenv
-langchain
-langchain-community
-langchain-chroma
-chromadb
-tiktoken
-dashscope
+# FastAPI and Server
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+pydantic==2.7.1
+
+# HTTP and Env
+requests==2.31.0
+python-dotenv==1.0.1
+
+# LangChain Core and Community (DashScope)
+langchain==0.2.1
+langchain-community==0.2.1
+dashscope==1.19.1
+
+# Vector Database
+langchain-chroma==0.1.1
+chromadb==0.5.0
+
+# Other
+tiktoken==0.7.0
