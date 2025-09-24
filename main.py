@@ -181,7 +181,6 @@ def import_repo_task(req: ImportRequest):
         vs = get_vectorstore(req.project_name)
         if docs:
             vs.add_documents(docs)
-            vs.persist()
         
         print(f"[BG Task] Import completed for project {req.project_name}.")
     except Exception as e:
@@ -221,6 +220,6 @@ def ask_code(req: AskRequest, authorization: Optional[str]=Header(None)):
             {"role":"user","content": f"问题：{req.question}\n\n相关片段（供参考）：\n{snippet}\n\n引用：\n{citations_text}"}
         ]
         resp = llm.invoke(messages)
-        return {"answer": resp.content, "citations": citations}
+        return {"answer": resp, "citations": citations}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"后端处理/ask时异常: {e}")
