@@ -1,11 +1,12 @@
 import os, requests, re
 from fastapi import FastAPI, BackgroundTasks, Response, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, AsyncGenerator
+from typing import List, Optional, Any, Dict, AsyncGenerator
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
-from langchain_community.chat_models.dashscope import Tongyi
+from langchain_community.llms import Tongyi
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_chroma import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -22,13 +23,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     print("Pre-loading DashScope (Alibaba Cloud) models...")
     load_dotenv()
 
-    # 使用阿里云通义千问作为对话模型
     llm = Tongyi(
         model_name=os.getenv("DASHSCOPE_MODEL", "qwen-max"),
         dashscope_api_key=os.getenv("DASHSCOPE_API_KEY"),
         temperature=0.2,
     )
-    # 使用阿里云通义千问作为嵌入模型
     emb = DashScopeEmbeddings(
         model="text-embedding-v2",
         dashscope_api_key=os.getenv("DASHSCOPE_API_KEY")
@@ -40,8 +39,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
 
 app = FastAPI(title="LangChain+Coze Agent Backend", lifespan=lifespan)
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # 环境变量与配置
@@ -111,15 +113,16 @@ def fetch_raw(owner, repo, branch, path, token=None):
     r.raise_for_status()
     return r.text
 
-def get_vectorstore(user_id:str):
-    safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', user_id)
-    if not safe_name or not safe_name[0].isalnum(): safe_name="c_"+safe_name
+def get_vectorstore(project_name: str):
+    safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', project_name)
+    if not safe_name or not safe_name[0].isalnum(): safe_name="proj_"+safe_name
     if len(safe_name)<3: safe_name=safe_name.ljust(3,'0')
     if len(safe_name)>63: safe_name=safe_name[:63]
     if safe_name.endswith(('_','.')): safe_name=safe_name[:-1]+'0'
     return Chroma(collection_name=safe_name, embedding_function=emb, persist_directory=CHROMA_DIR)
 
 def build_sys_prompt(memo: str):
+    """构建用于 LLM 的系统提示词。"""
     base = """你是开发辅助智能体。必须遵守：
 - 优先基于检索到的片段与用户上传的文件回答，并在答案末尾列出引用的“文件路径:行号”。
 - 当用户提出“修复/修改/重构/补丁”请求，请输出：
@@ -138,52 +141,86 @@ def build_sys_prompt(memo: str):
     return base
 
 class ImportRequest(BaseModel):
-    repo_url: str; branch: Optional[str] = ""; subdir: Optional[str] = ""; token: Optional[str] = None; include_ext: Optional[str] = None; max_files: Optional[int] = 800; user_id: str
+    repo_url: str
+    branch: Optional[str] = ""
+    subdir: Optional[str] = ""
+    token: Optional[str] = None
+    include_ext: Optional[List[str]] = None
+    max_files: Optional[int] = 800
+    project_name: str
 
 class AskRequest(BaseModel):
-    question: str; user_id: str
+    question: str
+    project_name: str
 
 def import_repo_task(req: ImportRequest):
-    print(f"[BG Task] Starting import for {req.user_id}: {req.repo_url}")
+    print(f"[BG Task] Starting import for project {req.project_name}: {req.repo_url}")
     try:
-        owner, repo, subdir0 = parse_repo(req.repo_url); token = req.token or GITHUB_TOKEN or None
-        branch_to_use = req.branch or get_default_branch(owner, repo, token); subdir = req.subdir or subdir0
-        include = set((req.include_ext or ",".join(ALLOW_EXT)).split(","))
-        print(f"[BG Task] Fetching file tree for {owner}/{repo}@{branch_to_use}..."); tree = get_tree(owner, repo, branch_to_use, token)
-        paths = filter_paths(tree, include, subdir, req.max_files or 800); print(f"[BG Task] Found {len(paths)} files to import.")
+        owner, repo, subdir0 = parse_repo(req.repo_url)
+        token = req.token or GITHUB_TOKEN or None
+        branch_to_use = req.branch or get_default_branch(owner, repo, token)
+        subdir = req.subdir or subdir0
+        include = set(req.include_ext or list(ALLOW_EXT))
+        
+        print(f"[BG Task] Fetching file tree for {owner}/{repo}@{branch_to_use}...")
+        tree = get_tree(owner, repo, branch_to_use, token)
+        paths = filter_paths(tree, include, subdir, req.max_files or 800)
+        print(f"[BG Task] Found {len(paths)} files to import.")
+        
         docs=[]
         for i, p in enumerate(paths):
             if i % 20 == 0: print(f"[BG Task] Processing file {i+1}/{len(paths)}: {p}")
             try:
                 txt = fetch_raw(owner, repo, branch_to_use, p, token)
                 if txt.strip():
-                    for chunk in text_splitter.split_text(txt): docs.append(Document(page_content=chunk, metadata={"repo":f"{owner}/{repo}","branch":branch_to_use,"path":p}))
+                    for chunk in text_splitter.split_text(txt):
+                        docs.append(Document(page_content=chunk, metadata={"repo":f"{owner}/{repo}","branch":branch_to_use,"path":p}))
             except: continue
-        print(f"[BG Task] Embedding {len(docs)} chunks..."); vs = get_vectorstore(req.user_id)
-        if docs: vs.add_documents(docs); vs.persist()
-        print(f"[BG Task] Import completed for {req.user_id}.")
-    except Exception as e: print(f"[BG Task] ERROR during import for {req.user_id}: {e}")
+        
+        print(f"[BG Task] Embedding {len(docs)} chunks...")
+        vs = get_vectorstore(req.project_name)
+        if docs:
+            vs.add_documents(docs)
+            vs.persist()
+        
+        print(f"[BG Task] Import completed for project {req.project_name}.")
+    except Exception as e:
+        print(f"[BG Task] ERROR during import for project {req.project_name}: {e}")
 
 @app.get("/health")
 def health(): return {"ok": True}
 
 @app.post("/import")
 def import_repo(req: ImportRequest, background_tasks: BackgroundTasks, authorization: Optional[str]=Header(None)):
-    auth_or_403(authorization or ""); background_tasks.add_task(import_repo_task, req)
-    return Response(status_code=202, content='{"message": "Import job started in background. Please wait a moment before asking questions."}', media_type="application/json")
+    auth_or_403(authorization or "")
+    background_tasks.add_task(import_repo_task, req)
+    return Response(
+        status_code=202,
+        content='{"message": "Import job started in background. Please wait a moment before asking questions."}',
+        media_type="application/json"
+    )
 
 @app.post("/ask")
 def ask_code(req: AskRequest, authorization: Optional[str]=Header(None)):
     auth_or_403(authorization or "")
     try:
-        vs = get_vectorstore(req.user_id); retriever = vs.as_retriever(search_kwargs={"k": 6})
+        vs = get_vectorstore(req.project_name)
+        retriever = vs.as_retriever(search_kwargs={"k": 6})
         rel_docs = retriever.invoke(req.question)
         citations = [f"{d.metadata.get('repo','')}/{d.metadata.get('path','')}" for d in rel_docs if d.metadata]
-        if not rel_docs: snippet = "(未检索到相关片段)"; citations_text = "(无引用)"
+        if not rel_docs:
+            snippet = "(未检索到相关片段)"
+            citations_text = "(无引用)"
         else:
             citations_text = "\n".join(f"- {c}" for c in citations)
             snippet = "\n\n".join([f"==== {c} ====\n{d.page_content[:800]}" for c, d in zip(citations, rel_docs)])
-        sys_prompt = build_sys_prompt(""); messages = [{"role":"system","content": sys_prompt}, {"role":"user","content": f"问题：{req.question}\n\n相关片段（供参考）：\n{snippet}\n\n引用：\n{citations_text}"}]
+        
+        sys_prompt = build_sys_prompt("")
+        messages = [
+            {"role":"system","content": sys_prompt},
+            {"role":"user","content": f"问题：{req.question}\n\n相关片段（供参考）：\n{snippet}\n\n引用：\n{citations_text}"}
+        ]
         resp = llm.invoke(messages)
         return {"answer": resp.content, "citations": citations}
-    except Exception as e: raise HTTPException(status_code=500, detail=f"后端处理/ask时异常: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"后端处理/ask时异常: {e}")
