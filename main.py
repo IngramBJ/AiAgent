@@ -62,7 +62,28 @@ def parse_repo(url: str):
     m = re.match(r"https?://github\.com/([^/]+)/([^/]+)(/.*)?", url.strip())
     if not m: raise ValueError("repo_url 需形如 https://github.com/owner/repo")
     owner, repo, extra = m.group(1), m.group(2), m.group(3) or ""
-    subdir = extra.strip("/").split("/",2)[-1] if extra.strip("/") else ""
+    
+    # Strip .git suffix from repo if present
+    if repo.endswith('.git'):
+        repo = repo[:-4]
+    
+    # Handle /tree/<branch>/<path> URLs
+    extra = extra.strip("/")
+    if extra:
+        parts = extra.split("/")
+        # If URL contains /tree/, extract the path after the branch
+        if len(parts) >= 2 and parts[0] == "tree":
+            # parts[1] is the branch name, everything after is the subdir
+            if len(parts) > 2:
+                subdir = "/".join(parts[2:])
+            else:
+                subdir = ""
+        else:
+            # Legacy format: /path/to/dir without /tree/
+            subdir = extra.split("/", 2)[-1] if extra else ""
+    else:
+        subdir = ""
+    
     return owner, repo, subdir
 
 def get_default_branch(owner, repo, token=None):
